@@ -51,7 +51,7 @@ def is_hallucination(text: str) -> bool:
 
 
 # ===== VOICE COMMANDS =====
-COMMANDS: list[tuple[re.Pattern, callable]] = []
+COMMANDS = []
 
 
 def cmd(pattern: str):
@@ -131,7 +131,7 @@ def _clean(text: str) -> str:
     return text.strip().rstrip(".,!?;:").strip()
 
 
-def match_command_full(text: str) -> callable | None:
+def match_command_full(text):
     clean = _clean(text)
     for pattern, fn in COMMANDS:
         if pattern.match(clean):
@@ -139,7 +139,7 @@ def match_command_full(text: str) -> callable | None:
     return None
 
 
-def match_command_trailing(text: str) -> tuple[str, callable | None]:
+def match_command_trailing(text):
     """Check if text ends with a command. Returns (remaining_text, command_fn)."""
     words = text.split()
     for n in range(1, min(6, len(words) + 1)):
