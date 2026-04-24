@@ -131,24 +131,23 @@ def _clean(text: str) -> str:
     return text.strip().rstrip(".,!?;:").strip()
 
 
-def try_command_full(text: str) -> str | None:
+def match_command_full(text: str) -> callable | None:
     clean = _clean(text)
     for pattern, fn in COMMANDS:
         if pattern.match(clean):
-            return fn()
+            return fn
     return None
 
 
-def try_command_trailing(text: str) -> tuple[str, str | None]:
-    """Check if text ends with a command. Returns (remaining_text, command_result)."""
+def match_command_trailing(text: str) -> tuple[str, callable | None]:
+    """Check if text ends with a command. Returns (remaining_text, command_fn)."""
     words = text.split()
     for n in range(1, min(6, len(words) + 1)):
         tail = _clean(" ".join(words[-n:]))
         for pattern, fn in COMMANDS:
             if pattern.match(tail):
                 remaining = " ".join(words[:-n]).strip()
-                result = fn()
-                return remaining, result
+                return remaining, fn
     return text, None
 
 
@@ -277,20 +276,22 @@ def transcription_worker():
 
         last_speech_time = time.time()
 
-        remaining, cmd_result = try_command_trailing(new_text)
+        remaining, cmd_fn = match_command_trailing(new_text)
 
-        if cmd_result is not None:
+        if cmd_fn is not None:
             with text_lock:
                 if current_text:
                     send_backspaces(len(current_text))
                 if remaining:
                     paste_text(remaining)
                 current_text = ""
+            time.sleep(0.05)
+            result = cmd_fn()
             with audio_lock:
                 audio_buffer.clear()
             last_speech_time = 0.0
-            last_status = f"cmd: {cmd_result}"
-            print(f"[cmd] {cmd_result}")
+            last_status = f"cmd: {result}"
+            print(f"[cmd] {result}")
             winsound.Beep(*BEEP_CMD)
             continue
 
@@ -330,28 +331,32 @@ def do_finalize():
         last_status = ""
         return
 
-    cmd_result = try_command_full(raw_text)
-    if cmd_result is not None:
+    cmd_fn = match_command_full(raw_text)
+    if cmd_fn is not None:
         with text_lock:
             if current_text:
                 send_backspaces(len(current_text))
             current_text = ""
+        time.sleep(0.05)
+        result = cmd_fn()
         winsound.Beep(*BEEP_CMD)
-        last_status = f"cmd: {cmd_result}"
-        print(f"[cmd] {cmd_result}")
+        last_status = f"cmd: {result}"
+        print(f"[cmd] {result}")
         return
 
-    remaining, cmd_result = try_command_trailing(raw_text)
-    if cmd_result is not None:
+    remaining, cmd_fn = match_command_trailing(raw_text)
+    if cmd_fn is not None:
         with text_lock:
             if current_text:
                 send_backspaces(len(current_text))
             if remaining:
                 paste_text(remaining)
             current_text = ""
+        time.sleep(0.05)
+        result = cmd_fn()
         winsound.Beep(*BEEP_CMD)
-        last_status = f"cmd: {cmd_result}"
-        print(f"[ok+cmd] {remaining} | {cmd_result}")
+        last_status = f"cmd: {result}"
+        print(f"[ok+cmd] {remaining} | {result}")
         return
 
     with text_lock:
@@ -476,7 +481,17 @@ class Overlay:
 
 # ===== MAIN =====
 threading.Thread(target=transcription_worker, daemon=True).start()
+def on_enter_pressed():
+    global current_text
+    if is_recording and current_text:
+        with text_lock:
+            current_text = ""
+        with audio_lock:
+            audio_buffer.clear()
+        print("[commit] enter detected")
+
 keyboard.on_press_key(TOGGLE_KEY, lambda _: threading.Thread(target=on_toggle, daemon=True).start())
+keyboard.on_press_key("enter", lambda _: on_enter_pressed())
 
 audio_stream = sd.InputStream(
     device=DEVICE_INDEX, samplerate=DEVICE_SR, channels=1,
