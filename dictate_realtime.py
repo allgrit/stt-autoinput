@@ -79,8 +79,9 @@ def paste_text(text: str):
     if not text:
         return
     pyperclip.copy(text)
+    time.sleep(0.02)
     keyboard.press_and_release("ctrl+v")
-    time.sleep(0.01)
+    time.sleep(0.02)
 
 
 def apply_diff(old_text: str, new_text: str):
@@ -168,6 +169,7 @@ def on_toggle():
                 audio_buffer.clear()
             with text_lock:
                 current_text = ""
+            pyperclip.copy("")
             threading.Thread(target=lambda: winsound.Beep(*BEEP_ON), daemon=True).start()
             print("[rec] ON")
         else:
