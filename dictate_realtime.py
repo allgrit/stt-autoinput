@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import time
 import threading
 import winsound
@@ -25,9 +26,107 @@ STREAM_INTERVAL = 0.8
 BEAM_INTERIM = 1
 BEAM_FINAL = 5
 DEVICE_INDEX = 1
+SILENCE_RMS = 0.01
 
 BEEP_ON = (1000, 100)
 BEEP_OFF = (600, 100)
+BEEP_CMD = (800, 50)
+
+# ===== HALLUCINATION FILTER =====
+HALLUCINATIONS = [
+    "спасибо за внимание", "спасибо за просмотр",
+    "подписывайтесь на канал", "продолжение следует",
+    "до новых встреч", "до свидания", "с вами был",
+    "редактор субтитров", "корректор", "добро пожаловать",
+    "music", "you", "thank you", "the end",
+]
+
+
+def is_hallucination(text: str) -> bool:
+    t = text.lower().strip().rstrip(".")
+    if len(t) < 3:
+        return True
+    return any(h in t for h in HALLUCINATIONS)
+
+
+# ===== VOICE COMMANDS =====
+COMMANDS: list[tuple[re.Pattern, callable]] = []
+
+
+def cmd(pattern: str):
+    def decorator(fn):
+        COMMANDS.append((re.compile(pattern, re.IGNORECASE), fn))
+        return fn
+    return decorator
+
+
+@cmd(r"^удали(ть)?\s+слово\.?$")
+def cmd_delete_word():
+    keyboard.send("ctrl+backspace")
+    return "удалить слово"
+
+
+@cmd(r"^удали(ть)?\s+(последнее\s+)?предложение\.?$")
+def cmd_delete_sentence():
+    keyboard.send("home")
+    time.sleep(0.02)
+    keyboard.send("shift+end")
+    time.sleep(0.02)
+    keyboard.send("backspace")
+    return "удалить предложение"
+
+
+@cmd(r"^удали(ть)?\s+строк[уа]\.?$")
+def cmd_delete_line():
+    keyboard.send("home")
+    time.sleep(0.02)
+    keyboard.send("shift+end")
+    time.sleep(0.02)
+    keyboard.send("backspace")
+    return "удалить строку"
+
+
+@cmd(r"^удали(ть)?\s+вс[её]\.?$")
+def cmd_delete_all():
+    keyboard.send("ctrl+a")
+    time.sleep(0.02)
+    keyboard.send("backspace")
+    return "удалить всё"
+
+
+@cmd(r"^отмен(ить|а|и)\.?$")
+def cmd_undo():
+    keyboard.send("ctrl+z")
+    return "отмена"
+
+
+@cmd(r"^нов(ая|ую)\s+строк[уа]\.?$")
+def cmd_newline():
+    keyboard.send("enter")
+    return "новая строка"
+
+
+@cmd(r"^нов(ый|ому)\s+(абзац|параграф)\.?$")
+def cmd_paragraph():
+    keyboard.send("enter")
+    time.sleep(0.02)
+    keyboard.send("enter")
+    return "новый абзац"
+
+
+@cmd(r"^таб(уляция)?\.?$")
+def cmd_tab():
+    keyboard.send("tab")
+    return "таб"
+
+
+def try_command(text: str) -> str | None:
+    clean = text.strip().rstrip(".,!?;:")
+    for pattern, fn in COMMANDS:
+        if pattern.match(clean):
+            return fn()
+    return None
+
 
 # ===== AUDIO DEVICE =====
 dev_info = sd.query_devices(DEVICE_INDEX)
@@ -44,7 +143,7 @@ def resample_to_whisper(audio: np.ndarray) -> np.ndarray:
 
 # ===== MODEL =====
 print(f"[init] {dev_info['name']} ({DEVICE_SR} Hz)")
-print(f"[init] Загрузка модели '{MODEL_SIZE}'...")
+print(f"[init] Whisper '{MODEL_SIZE}'...")
 model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
 print("[init] Готово.\n")
 
@@ -57,6 +156,7 @@ is_recording = False
 stream_active = False
 current_text = ""
 rec_start_time = 0.0
+last_status = ""
 
 
 def get_audio_snapshot() -> np.ndarray | None:
@@ -65,6 +165,10 @@ def get_audio_snapshot() -> np.ndarray | None:
             return None
         raw = np.concatenate(audio_buffer, axis=0).flatten()
     return resample_to_whisper(raw)
+
+
+def audio_is_silent(audio: np.ndarray) -> bool:
+    return np.sqrt(np.mean(audio ** 2)) < SILENCE_RMS
 
 
 def send_backspaces(n: int):
@@ -109,16 +213,18 @@ def transcription_worker():
             continue
 
         audio = get_audio_snapshot()
-        if audio is None or len(audio) < WHISPER_SR * 0.3:
+        if audio is None or len(audio) < WHISPER_SR * 0.3 or audio_is_silent(audio):
             continue
 
         try:
-            segments, _ = model.transcribe(audio, language=LANG, beam_size=BEAM_INTERIM)
+            segments, _ = model.transcribe(
+                audio, language=LANG, beam_size=BEAM_INTERIM, vad_filter=True,
+            )
             new_text = " ".join(seg.text for seg in segments).strip()
         except Exception:
             continue
 
-        if not new_text or not stream_active:
+        if not new_text or not stream_active or is_hallucination(new_text):
             continue
 
         with text_lock:
@@ -129,34 +235,56 @@ def transcription_worker():
 
 # ===== TOGGLE =====
 def do_finalize():
-    global current_text
+    global current_text, last_status
+
     audio = get_audio_snapshot()
 
-    if audio is not None and len(audio) >= WHISPER_SR * 0.3:
-        try:
-            segments, _ = model.transcribe(audio, language=LANG, beam_size=BEAM_FINAL)
-            final_text = " ".join(seg.text for seg in segments).strip()
-        except Exception:
-            final_text = ""
-
-        with text_lock:
-            if final_text:
-                if current_text:
-                    send_backspaces(len(current_text))
-                paste_text(final_text)
-                print(f"[ok] {final_text}")
-            elif current_text:
-                send_backspaces(len(current_text))
-            current_text = ""
-    else:
+    if audio is None or len(audio) < WHISPER_SR * 0.3 or audio_is_silent(audio):
         with text_lock:
             if current_text:
                 send_backspaces(len(current_text))
             current_text = ""
+        last_status = ""
+        return
+
+    try:
+        segments, _ = model.transcribe(
+            audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
+        )
+        raw_text = " ".join(seg.text for seg in segments).strip()
+    except Exception:
+        raw_text = ""
+
+    if not raw_text or is_hallucination(raw_text):
+        with text_lock:
+            if current_text:
+                send_backspaces(len(current_text))
+            current_text = ""
+        last_status = ""
+        return
+
+    cmd_result = try_command(raw_text)
+    if cmd_result is not None:
+        with text_lock:
+            if current_text:
+                send_backspaces(len(current_text))
+            current_text = ""
+        threading.Thread(target=lambda: winsound.Beep(*BEEP_CMD), daemon=True).start()
+        last_status = f"cmd: {cmd_result}"
+        print(f"[cmd] {cmd_result}")
+        return
+
+    with text_lock:
+        if current_text:
+            send_backspaces(len(current_text))
+        paste_text(raw_text)
+        current_text = ""
+    last_status = raw_text
+    print(f"[ok] {raw_text}")
 
 
 def on_toggle():
-    global is_recording, stream_active, current_text, rec_start_time
+    global is_recording, stream_active, current_text, rec_start_time, last_status
 
     if not toggle_lock.acquire(blocking=False):
         return
@@ -170,13 +298,13 @@ def on_toggle():
             with text_lock:
                 current_text = ""
             pyperclip.copy("")
+            last_status = ""
             threading.Thread(target=lambda: winsound.Beep(*BEEP_ON), daemon=True).start()
             print("[rec] ON")
         else:
             stream_active = False
             is_recording = False
             threading.Thread(target=lambda: winsound.Beep(*BEEP_OFF), daemon=True).start()
-            print("[rec] OFF — finalizing...")
             do_finalize()
     finally:
         toggle_lock.release()
@@ -196,6 +324,7 @@ class Overlay:
     GRAY = "#555555"
     WHITE = "#e0e0e0"
     DIM = "#777777"
+    CYAN = "#66cccc"
 
     def __init__(self):
         self.root = tk.Tk()
@@ -206,7 +335,7 @@ class Overlay:
         self.root.configure(bg=self.BG)
 
         screen_w = self.root.winfo_screenwidth()
-        self.root.geometry(f"300x38+{screen_w - 320}+18")
+        self.root.geometry(f"320x38+{screen_w - 340}+18")
 
         frame = tk.Frame(self.root, bg=self.BG)
         frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
@@ -239,8 +368,7 @@ class Overlay:
     def _tick(self):
         if is_recording:
             self._pulse_on = not self._pulse_on
-            dot_color = self.RED if self._pulse_on else "#aa2222"
-            self.canvas.itemconfig(self.dot, fill=dot_color)
+            self.canvas.itemconfig(self.dot, fill=self.RED if self._pulse_on else "#aa2222")
 
             elapsed = int(time.time() - rec_start_time)
             mins, secs = divmod(elapsed, 60)
@@ -249,13 +377,16 @@ class Overlay:
             with text_lock:
                 txt = current_text
             if txt:
-                show = txt if len(txt) <= 28 else "..." + txt[-25:]
+                show = txt if len(txt) <= 26 else "..." + txt[-23:]
                 self.label.config(text=f"{timer}  {show}", fg=self.WHITE)
             else:
                 self.label.config(text=f"{timer}  ...", fg="#ff8888")
         else:
             self.canvas.itemconfig(self.dot, fill=self.GRAY)
-            self.label.config(text="Готово  [F9]", fg=self.DIM)
+            if last_status and last_status.startswith("cmd:"):
+                self.label.config(text=last_status, fg=self.CYAN)
+            else:
+                self.label.config(text="Готово  [F9]", fg=self.DIM)
 
         self.root.after(120, self._tick)
 
@@ -265,7 +396,6 @@ class Overlay:
 
 # ===== MAIN =====
 threading.Thread(target=transcription_worker, daemon=True).start()
-
 keyboard.on_press_key(TOGGLE_KEY, lambda _: threading.Thread(target=on_toggle, daemon=True).start())
 
 audio_stream = sd.InputStream(
@@ -273,7 +403,11 @@ audio_stream = sd.InputStream(
     blocksize=1024, latency="high", callback=audio_callback,
 )
 audio_stream.start()
-print(f"[ready] F9 = toggle, widget active\n")
+
+print("[ready] F9 = toggle")
+print("[cmds]  удалить слово / предложение / строку / всё")
+print("[cmds]  отменить, новая строка, новый абзац, таб")
+print("[filter] VAD + hallucination filter active\n")
 
 Overlay().run()
 
