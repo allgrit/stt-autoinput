@@ -1,0 +1,66 @@
+from __future__ import annotations
+import json
+import os
+import sys
+
+DEFAULTS = {
+    "model_size": "medium",
+    "language": "ru",
+    "toggle_key": "f9",
+    "device_index": None,
+    "device_name": None,
+    "compute_device": "auto",
+    "compute_type": "float16",
+    "stream_interval": 0.8,
+    "beam_interim": 1,
+    "beam_final": 5,
+    "silence_rms": 0.01,
+    "commit_pause": 1.5,
+    "beep_on": [1000, 100],
+    "beep_off": [600, 100],
+    "beep_cmd": [800, 50],
+}
+
+MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
+
+
+def _config_path():
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "config.json")
+
+
+def load_config():
+    path = _config_path()
+    cfg = dict(DEFAULTS)
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                user = json.load(f)
+            cfg.update(user)
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg):
+    path = _config_path()
+    clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(clean, f, ensure_ascii=False, indent=2)
+
+
+def needs_setup(cfg):
+    return cfg.get("device_index") is None
+
+
+def detect_compute():
+    try:
+        from faster_whisper import WhisperModel
+        m = WhisperModel("tiny", device="cuda", compute_type="float16")
+        del m
+        return "cuda", "float16"
+    except Exception:
+        return "cpu", "float32"

@@ -1,3 +1,4 @@
+from __future__ import annotations
 import sys
 import os
 import re
@@ -17,21 +18,37 @@ from faster_whisper import WhisperModel
 import keyboard
 import pyperclip
 
-# ===== CONFIG =====
-MODEL_SIZE = "medium"
-LANG = "ru"
-TOGGLE_KEY = "f9"
-WHISPER_SR = 16000
-STREAM_INTERVAL = 0.8
-BEAM_INTERIM = 1
-BEAM_FINAL = 5
-DEVICE_INDEX = 1
-SILENCE_RMS = 0.01
-COMMIT_PAUSE = 1.5
+from config import load_config, save_config, needs_setup, detect_compute
+from setup_dialog import run_setup
 
-BEEP_ON = (1000, 100)
-BEEP_OFF = (600, 100)
-BEEP_CMD = (800, 50)
+# ===== CONFIG =====
+cfg = load_config()
+
+if needs_setup(cfg):
+    cfg = run_setup(cfg)
+    save_config(cfg)
+
+MODEL_SIZE = cfg["model_size"]
+LANG = cfg["language"]
+TOGGLE_KEY = cfg["toggle_key"]
+DEVICE_INDEX = cfg["device_index"]
+WHISPER_SR = 16000
+STREAM_INTERVAL = cfg["stream_interval"]
+BEAM_INTERIM = cfg["beam_interim"]
+BEAM_FINAL = cfg["beam_final"]
+SILENCE_RMS = cfg["silence_rms"]
+COMMIT_PAUSE = cfg["commit_pause"]
+
+BEEP_ON = tuple(cfg["beep_on"])
+BEEP_OFF = tuple(cfg["beep_off"])
+BEEP_CMD = tuple(cfg["beep_cmd"])
+
+# ===== COMPUTE DEVICE =====
+if cfg["compute_device"] == "auto":
+    COMPUTE_DEVICE, COMPUTE_TYPE = detect_compute()
+else:
+    COMPUTE_DEVICE = cfg["compute_device"]
+    COMPUTE_TYPE = cfg["compute_type"]
 
 # ===== HALLUCINATION FILTER =====
 HALLUCINATIONS = [
@@ -43,7 +60,7 @@ HALLUCINATIONS = [
 ]
 
 
-def is_hallucination(text: str) -> bool:
+def is_hallucination(text):
     t = text.lower().strip().rstrip(".")
     if len(t) < 3:
         return True
@@ -54,7 +71,7 @@ def is_hallucination(text: str) -> bool:
 COMMANDS = []
 
 
-def cmd(pattern: str):
+def cmd(pattern):
     def decorator(fn):
         COMMANDS.append((re.compile(pattern, re.IGNORECASE), fn))
         return fn
@@ -127,7 +144,7 @@ def cmd_tab():
     return "таб"
 
 
-def _clean(text: str) -> str:
+def _clean(text):
     return text.strip().rstrip(".,!?;:").strip()
 
 
@@ -140,7 +157,6 @@ def match_command_full(text):
 
 
 def match_command_trailing(text):
-    """Check if text ends with a command. Returns (remaining_text, command_fn)."""
     words = text.split()
     for n in range(1, min(6, len(words) + 1)):
         tail = _clean(" ".join(words[-n:]))
@@ -158,7 +174,7 @@ _g = gcd(WHISPER_SR, DEVICE_SR)
 _UP, _DOWN = WHISPER_SR // _g, DEVICE_SR // _g
 
 
-def resample_to_whisper(audio: np.ndarray) -> np.ndarray:
+def resample_to_whisper(audio):
     if DEVICE_SR == WHISPER_SR:
         return audio
     return resample_poly(audio, _UP, _DOWN).astype(np.float32)
@@ -166,15 +182,20 @@ def resample_to_whisper(audio: np.ndarray) -> np.ndarray:
 
 # ===== MODEL =====
 print(f"[init] {dev_info['name']} ({DEVICE_SR} Hz)")
-print(f"[init] Whisper '{MODEL_SIZE}'...")
-model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
-print("[init] Готово.\n")
+print(f"[init] Whisper '{MODEL_SIZE}' on {COMPUTE_DEVICE} ({COMPUTE_TYPE})...")
+try:
+    model = WhisperModel(MODEL_SIZE, device=COMPUTE_DEVICE, compute_type=COMPUTE_TYPE)
+except Exception as e:
+    print(f"[init] GPU failed ({e}), falling back to CPU...")
+    COMPUTE_DEVICE, COMPUTE_TYPE = "cpu", "float32"
+    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="float32")
+print("[init] Ready.\n")
 
 # ===== STATE =====
 audio_lock = threading.Lock()
 text_lock = threading.Lock()
 toggle_lock = threading.Lock()
-audio_buffer: list[np.ndarray] = []
+audio_buffer = []
 is_recording = False
 stream_active = False
 current_text = ""
@@ -182,7 +203,7 @@ rec_start_time = 0.0
 last_status = ""
 
 
-def get_audio_snapshot() -> np.ndarray | None:
+def get_audio_snapshot():
     with audio_lock:
         if not audio_buffer:
             return None
@@ -190,11 +211,11 @@ def get_audio_snapshot() -> np.ndarray | None:
     return resample_to_whisper(raw)
 
 
-def audio_is_silent(audio: np.ndarray) -> bool:
+def audio_is_silent(audio):
     return np.sqrt(np.mean(audio ** 2)) < SILENCE_RMS
 
 
-def recent_audio_is_silent() -> bool:
+def recent_audio_is_silent():
     with audio_lock:
         if not audio_buffer:
             return True
@@ -206,7 +227,7 @@ def recent_audio_is_silent() -> bool:
     return audio_is_silent(audio)
 
 
-def send_backspaces(n: int):
+def send_backspaces(n):
     if n <= 0:
         return
     for _ in range(n):
@@ -214,7 +235,7 @@ def send_backspaces(n: int):
     time.sleep(0.01)
 
 
-def paste_text(text: str):
+def paste_text(text):
     if not text:
         return
     pyperclip.copy(text)
@@ -223,7 +244,7 @@ def paste_text(text: str):
     time.sleep(0.02)
 
 
-def apply_diff(old_text: str, new_text: str):
+def apply_diff(old_text, new_text):
     common = 0
     for a, b in zip(old_text, new_text):
         if a == b:
@@ -429,15 +450,22 @@ class Overlay:
         self.canvas.pack(side=tk.LEFT, padx=(0, 8))
         self.dot = self.canvas.create_oval(2, 2, 14, 14, fill=self.GRAY, outline="")
 
-        self.label = tk.Label(frame, text="Готово  [F9]", fg=self.DIM, bg=self.BG,
-                              font=("Segoe UI", 10), anchor="w")
+        self.label = tk.Label(frame, text=f"Ready  [{TOGGLE_KEY.upper()}]", fg=self.DIM,
+                              bg=self.BG, font=("Segoe UI", 10), anchor="w")
         self.label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self._pulse_on = True
         self.root.bind("<Button-1>", self._drag_start)
         self.root.bind("<B1-Motion>", self._drag_move)
+        self.root.bind("<Button-3>", self._context_menu)
         self._dx = 0
         self._dy = 0
+
+        self._menu = tk.Menu(self.root, tearoff=0, bg="#2a2a3e", fg="#e0e0e0",
+                              activebackground="#3a3a5e", font=("Segoe UI", 9))
+        self._menu.add_command(label="Settings...", command=self._open_settings)
+        self._menu.add_separator()
+        self._menu.add_command(label="Exit", command=self._quit)
 
         self.root.after(120, self._tick)
 
@@ -449,6 +477,17 @@ class Overlay:
         x = self.root.winfo_x() + e.x - self._dx
         y = self.root.winfo_y() + e.y - self._dy
         self.root.geometry(f"+{x}+{y}")
+
+    def _context_menu(self, e):
+        self._menu.post(e.x_root, e.y_root)
+
+    def _open_settings(self):
+        new_cfg = run_setup(cfg)
+        save_config(new_cfg)
+        self.label.config(text="Restart to apply", fg="#ffcc00")
+
+    def _quit(self):
+        self.root.destroy()
 
     def _tick(self):
         if is_recording:
@@ -471,7 +510,7 @@ class Overlay:
             if last_status and last_status.startswith("cmd:"):
                 self.label.config(text=last_status, fg=self.CYAN)
             else:
-                self.label.config(text="Готово  [F9]", fg=self.DIM)
+                self.label.config(text=f"Ready  [{TOGGLE_KEY.upper()}]", fg=self.DIM)
 
         self.root.after(120, self._tick)
 
@@ -479,8 +518,7 @@ class Overlay:
         self.root.mainloop()
 
 
-# ===== MAIN =====
-threading.Thread(target=transcription_worker, daemon=True).start()
+# ===== ENTER HOOK =====
 def on_enter_pressed():
     global current_text
     if is_recording and current_text:
@@ -490,6 +528,9 @@ def on_enter_pressed():
             audio_buffer.clear()
         print("[commit] enter detected")
 
+
+# ===== MAIN =====
+threading.Thread(target=transcription_worker, daemon=True).start()
 keyboard.on_press_key(TOGGLE_KEY, lambda _: threading.Thread(target=on_toggle, daemon=True).start())
 keyboard.on_press_key("enter", lambda _: on_enter_pressed())
 
@@ -499,10 +540,10 @@ audio_stream = sd.InputStream(
 )
 audio_stream.start()
 
-print("[ready] F9 = toggle")
+print(f"[ready] {TOGGLE_KEY.upper()} = toggle | {COMPUTE_DEVICE}")
 print("[cmds]  удалить слово / предложение / строку / всё")
 print("[cmds]  отменить, новая строка, новый абзац, таб, энтер")
-print(f"[filter] VAD + hallucination filter + auto-commit ({COMMIT_PAUSE}s pause)\n")
+print(f"[filter] VAD + hallucination filter + auto-commit ({COMMIT_PAUSE}s)\n")
 
 Overlay().run()
 
