@@ -27,6 +27,7 @@ BEAM_INTERIM = 1
 BEAM_FINAL = 5
 DEVICE_INDEX = 1
 SILENCE_RMS = 0.01
+COMMIT_PAUSE = 1.5
 
 BEEP_ON = (1000, 100)
 BEEP_OFF = (600, 100)
@@ -60,13 +61,13 @@ def cmd(pattern: str):
     return decorator
 
 
-@cmd(r"^удали(ть)?\s+слово\.?$")
+@cmd(r"^удали(ть|те)?\s+слово$")
 def cmd_delete_word():
     keyboard.send("ctrl+backspace")
     return "удалить слово"
 
 
-@cmd(r"^удали(ть)?\s+(последнее\s+)?предложение\.?$")
+@cmd(r"^удали(ть|те)?\s+(последнее\s+)?предложение$")
 def cmd_delete_sentence():
     keyboard.send("home")
     time.sleep(0.02)
@@ -76,7 +77,7 @@ def cmd_delete_sentence():
     return "удалить предложение"
 
 
-@cmd(r"^удали(ть)?\s+строк[уа]\.?$")
+@cmd(r"^удали(ть|те)?\s+строк[уа]$")
 def cmd_delete_line():
     keyboard.send("home")
     time.sleep(0.02)
@@ -86,7 +87,7 @@ def cmd_delete_line():
     return "удалить строку"
 
 
-@cmd(r"^удали(ть)?\s+вс[её]\.?$")
+@cmd(r"^удали(ть|те)?\s+вс[её]$")
 def cmd_delete_all():
     keyboard.send("ctrl+a")
     time.sleep(0.02)
@@ -94,19 +95,25 @@ def cmd_delete_all():
     return "удалить всё"
 
 
-@cmd(r"^отмен(ить|а|и)\.?$")
+@cmd(r"^отмен(ить|а|и|ите)$")
 def cmd_undo():
     keyboard.send("ctrl+z")
     return "отмена"
 
 
-@cmd(r"^нов(ая|ую)\s+строк[уа]\.?$")
+@cmd(r"^нов(ая|ую)\s+строк[уа]$")
 def cmd_newline():
     keyboard.send("enter")
     return "новая строка"
 
 
-@cmd(r"^нов(ый|ому)\s+(абзац|параграф)\.?$")
+@cmd(r"^(enter|энтер|ввод)$")
+def cmd_enter():
+    keyboard.send("enter")
+    return "enter"
+
+
+@cmd(r"^нов(ый|ому)\s+(абзац|параграф)$")
 def cmd_paragraph():
     keyboard.send("enter")
     time.sleep(0.02)
@@ -114,18 +121,35 @@ def cmd_paragraph():
     return "новый абзац"
 
 
-@cmd(r"^таб(уляция)?\.?$")
+@cmd(r"^таб(уляция)?$")
 def cmd_tab():
     keyboard.send("tab")
     return "таб"
 
 
-def try_command(text: str) -> str | None:
-    clean = text.strip().rstrip(".,!?;:")
+def _clean(text: str) -> str:
+    return text.strip().rstrip(".,!?;:").strip()
+
+
+def try_command_full(text: str) -> str | None:
+    clean = _clean(text)
     for pattern, fn in COMMANDS:
         if pattern.match(clean):
             return fn()
     return None
+
+
+def try_command_trailing(text: str) -> tuple[str, str | None]:
+    """Check if text ends with a command. Returns (remaining_text, command_result)."""
+    words = text.split()
+    for n in range(1, min(6, len(words) + 1)):
+        tail = _clean(" ".join(words[-n:]))
+        for pattern, fn in COMMANDS:
+            if pattern.match(tail):
+                remaining = " ".join(words[:-n]).strip()
+                result = fn()
+                return remaining, result
+    return text, None
 
 
 # ===== AUDIO DEVICE =====
@@ -171,6 +195,18 @@ def audio_is_silent(audio: np.ndarray) -> bool:
     return np.sqrt(np.mean(audio ** 2)) < SILENCE_RMS
 
 
+def recent_audio_is_silent() -> bool:
+    with audio_lock:
+        if not audio_buffer:
+            return True
+        n_chunks = int(COMMIT_PAUSE * DEVICE_SR / 1024)
+        recent = audio_buffer[-n_chunks:]
+        if not recent:
+            return True
+        audio = np.concatenate(recent, axis=0).flatten()
+    return audio_is_silent(audio)
+
+
 def send_backspaces(n: int):
     if n <= 0:
         return
@@ -201,16 +237,28 @@ def apply_diff(old_text: str, new_text: str):
 
 # ===== STREAMING WORKER =====
 def transcription_worker():
-    global current_text
+    global current_text, last_status
+    last_speech_time = 0.0
 
     while True:
         if not stream_active:
+            last_speech_time = 0.0
             time.sleep(0.1)
             continue
 
         time.sleep(STREAM_INTERVAL)
         if not stream_active:
             continue
+
+        if current_text and last_speech_time and recent_audio_is_silent():
+            if time.time() - last_speech_time > COMMIT_PAUSE:
+                with text_lock:
+                    print(f"[commit] {current_text}")
+                    current_text = ""
+                with audio_lock:
+                    audio_buffer.clear()
+                last_speech_time = 0.0
+                continue
 
         audio = get_audio_snapshot()
         if audio is None or len(audio) < WHISPER_SR * 0.3 or audio_is_silent(audio):
@@ -225,6 +273,25 @@ def transcription_worker():
             continue
 
         if not new_text or not stream_active or is_hallucination(new_text):
+            continue
+
+        last_speech_time = time.time()
+
+        remaining, cmd_result = try_command_trailing(new_text)
+
+        if cmd_result is not None:
+            with text_lock:
+                if current_text:
+                    send_backspaces(len(current_text))
+                if remaining:
+                    paste_text(remaining)
+                current_text = ""
+            with audio_lock:
+                audio_buffer.clear()
+            last_speech_time = 0.0
+            last_status = f"cmd: {cmd_result}"
+            print(f"[cmd] {cmd_result}")
+            winsound.Beep(*BEEP_CMD)
             continue
 
         with text_lock:
@@ -263,15 +330,28 @@ def do_finalize():
         last_status = ""
         return
 
-    cmd_result = try_command(raw_text)
+    cmd_result = try_command_full(raw_text)
     if cmd_result is not None:
         with text_lock:
             if current_text:
                 send_backspaces(len(current_text))
             current_text = ""
-        threading.Thread(target=lambda: winsound.Beep(*BEEP_CMD), daemon=True).start()
+        winsound.Beep(*BEEP_CMD)
         last_status = f"cmd: {cmd_result}"
         print(f"[cmd] {cmd_result}")
+        return
+
+    remaining, cmd_result = try_command_trailing(raw_text)
+    if cmd_result is not None:
+        with text_lock:
+            if current_text:
+                send_backspaces(len(current_text))
+            if remaining:
+                paste_text(remaining)
+            current_text = ""
+        winsound.Beep(*BEEP_CMD)
+        last_status = f"cmd: {cmd_result}"
+        print(f"[ok+cmd] {remaining} | {cmd_result}")
         return
 
     with text_lock:
@@ -406,8 +486,8 @@ audio_stream.start()
 
 print("[ready] F9 = toggle")
 print("[cmds]  удалить слово / предложение / строку / всё")
-print("[cmds]  отменить, новая строка, новый абзац, таб")
-print("[filter] VAD + hallucination filter active\n")
+print("[cmds]  отменить, новая строка, новый абзац, таб, энтер")
+print(f"[filter] VAD + hallucination filter + auto-commit ({COMMIT_PAUSE}s pause)\n")
 
 Overlay().run()
 
