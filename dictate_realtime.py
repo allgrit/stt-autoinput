@@ -318,8 +318,13 @@ def transcription_worker():
 
         with text_lock:
             if new_text != current_text:
-                apply_diff(current_text, new_text)
-                current_text = new_text
+                if new_text.startswith(current_text):
+                    to_append = new_text[len(current_text):]
+                    paste_text(to_append)
+                    current_text = new_text
+                elif not current_text:
+                    paste_text(new_text)
+                    current_text = new_text
 
 
 # ===== TOGGLE =====
