@@ -272,31 +272,29 @@ def transcription_worker():
 
         if current_text and last_speech_time and recent_audio_is_silent():
             if time.time() - last_speech_time > COMMIT_PAUSE:
-                audio = get_audio_snapshot()
-                if audio is not None and len(audio) >= WHISPER_SR * 0.3:
+                commit_audio = get_audio_snapshot()
+                commit_old = current_text
+                with audio_lock:
+                    audio_buffer.clear()
+                with text_lock:
+                    current_text = ""
+                last_speech_time = 0.0
+
+                if commit_audio is not None and len(commit_audio) >= WHISPER_SR * 0.3:
                     try:
                         segments, _ = model.transcribe(
-                            audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
+                            commit_audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
                         )
                         final = " ".join(seg.text for seg in segments).strip()
                     except Exception:
                         final = ""
-                    if final and not is_hallucination(final):
+                    if final and not is_hallucination(final) and final != commit_old:
                         with text_lock:
-                            if current_text:
-                                send_backspaces(len(current_text))
+                            send_backspaces(len(commit_old))
                             paste_text(final)
-                            current_text = ""
                         print(f"[commit] {final}")
                     else:
-                        with text_lock:
-                            current_text = ""
-                else:
-                    with text_lock:
-                        current_text = ""
-                with audio_lock:
-                    audio_buffer.clear()
-                last_speech_time = 0.0
+                        print(f"[commit] {commit_old}")
                 continue
 
         audio = get_audio_snapshot()
