@@ -255,6 +255,24 @@ def apply_diff(old_text, new_text):
     paste_text(new_text[common:])
 
 
+# ===== BACKGROUND REFINE =====
+def _bg_refine(audio_snap, old_text):
+    try:
+        segments, _ = model.transcribe(
+            audio_snap, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
+        )
+        final = " ".join(seg.text for seg in segments).strip()
+    except Exception:
+        return
+    if not final or is_hallucination(final) or final == old_text:
+        return
+    with text_lock:
+        if not current_text:
+            send_backspaces(len(old_text))
+            paste_text(final)
+            print(f"[refine] {final}")
+
+
 # ===== STREAMING WORKER =====
 def transcription_worker():
     global current_text, last_status
@@ -279,22 +297,12 @@ def transcription_worker():
                 with text_lock:
                     current_text = ""
                 last_speech_time = 0.0
+                print(f"[commit] {commit_old}")
 
                 if commit_audio is not None and len(commit_audio) >= WHISPER_SR * 0.3:
-                    try:
-                        segments, _ = model.transcribe(
-                            commit_audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
-                        )
-                        final = " ".join(seg.text for seg in segments).strip()
-                    except Exception:
-                        final = ""
-                    if final and not is_hallucination(final) and final != commit_old:
-                        with text_lock:
-                            send_backspaces(len(commit_old))
-                            paste_text(final)
-                        print(f"[commit] {final}")
-                    else:
-                        print(f"[commit] {commit_old}")
+                    threading.Thread(
+                        target=_bg_refine, args=(commit_audio, commit_old), daemon=True,
+                    ).start()
                 continue
 
         audio = get_audio_snapshot()
