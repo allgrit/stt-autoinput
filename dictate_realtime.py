@@ -609,13 +609,19 @@ def _try_open_stream(dev_idx, sr):
 audio_stream = _try_open_stream(DEVICE_INDEX, DEVICE_SR)
 
 if audio_stream is None:
-    print(f"[warn] device {DEVICE_INDEX} failed, trying alternatives...")
-    for d in sd.query_devices():
-        idx = sd.query_devices().tolist().index(d) if hasattr(sd.query_devices(), 'tolist') else 0
+    print(f"[warn] device {DEVICE_INDEX} failed, trying same mic on other APIs...")
+    _target_name = cfg.get("device_name", "")
+    _candidates = []
     for idx in range(len(sd.query_devices())):
         info = sd.query_devices(idx)
         if info["max_input_channels"] == 0 or idx == DEVICE_INDEX:
             continue
+        if _target_name and _target_name in info["name"]:
+            _candidates.insert(0, idx)
+        else:
+            _candidates.append(idx)
+    for idx in _candidates:
+        info = sd.query_devices(idx)
         sr = int(info["default_samplerate"])
         audio_stream = _try_open_stream(idx, sr)
         if audio_stream is not None:
