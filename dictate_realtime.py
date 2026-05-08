@@ -288,7 +288,9 @@ def transcription_worker():
         if not stream_active:
             continue
 
-        if current_text and last_speech_time and recent_audio_is_silent():
+        silence = recent_audio_is_silent()
+
+        if current_text and last_speech_time and silence:
             if time.time() - last_speech_time > COMMIT_PAUSE:
                 commit_audio = get_audio_snapshot()
                 commit_old = current_text
@@ -305,8 +307,11 @@ def transcription_worker():
                     ).start()
                 continue
 
+        if silence:
+            continue
+
         audio = get_audio_snapshot()
-        if audio is None or len(audio) < WHISPER_SR * 0.3 or audio_is_silent(audio):
+        if audio is None or len(audio) < WHISPER_SR * 0.3:
             continue
 
         try:
@@ -320,7 +325,8 @@ def transcription_worker():
         if not new_text or not stream_active or is_hallucination(new_text):
             continue
 
-        last_speech_time = time.time()
+        if len(new_text) > len(current_text):
+            last_speech_time = time.time()
 
         remaining, cmd_fn = match_command_trailing(new_text)
 
@@ -568,11 +574,40 @@ threading.Thread(target=transcription_worker, daemon=True).start()
 keyboard.on_press_key(TOGGLE_KEY, lambda _: threading.Thread(target=on_toggle, daemon=True).start())
 keyboard.on_press_key("enter", lambda _: on_enter_pressed())
 
-audio_stream = sd.InputStream(
-    device=DEVICE_INDEX, samplerate=DEVICE_SR, channels=1,
-    blocksize=1024, latency="high", callback=audio_callback,
-)
-audio_stream.start()
+audio_stream = None
+
+def _try_open_stream(dev_idx, sr):
+    try:
+        s = sd.InputStream(device=dev_idx, samplerate=sr, channels=1,
+                           blocksize=1024, latency="high", callback=audio_callback)
+        s.start()
+        return s
+    except Exception:
+        return None
+
+audio_stream = _try_open_stream(DEVICE_INDEX, DEVICE_SR)
+
+if audio_stream is None:
+    print(f"[warn] device {DEVICE_INDEX} failed, trying alternatives...")
+    for d in sd.query_devices():
+        idx = sd.query_devices().tolist().index(d) if hasattr(sd.query_devices(), 'tolist') else 0
+    for idx in range(len(sd.query_devices())):
+        info = sd.query_devices(idx)
+        if info["max_input_channels"] == 0 or idx == DEVICE_INDEX:
+            continue
+        sr = int(info["default_samplerate"])
+        audio_stream = _try_open_stream(idx, sr)
+        if audio_stream is not None:
+            DEVICE_SR = sr
+            _g = gcd(WHISPER_SR, DEVICE_SR)
+            _UP = WHISPER_SR // _g
+            _DOWN = DEVICE_SR // _g
+            print(f"[ok] using [{idx}] {info['name']} ({sr} Hz)")
+            break
+
+if audio_stream is None:
+    print("[error] No working audio device found!")
+    sys.exit(1)
 
 print(f"[ready] {TOGGLE_KEY.upper()} = toggle | {COMPUTE_DEVICE}")
 print("[cmds]  удалить слово / предложение / строку / всё")
