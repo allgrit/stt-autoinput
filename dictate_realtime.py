@@ -31,7 +31,28 @@ if needs_setup(cfg):
 MODEL_SIZE = cfg["model_size"]
 LANG = cfg["language"]
 TOGGLE_KEY = cfg["toggle_key"]
+
+# Auto-resolve device by name if index doesn't match
 DEVICE_INDEX = cfg["device_index"]
+_device_name = cfg.get("device_name", "")
+if DEVICE_INDEX is not None and _device_name:
+    try:
+        info = sd.query_devices(DEVICE_INDEX)
+        if _device_name not in info.get("name", ""):
+            for i, d in enumerate(sd.query_devices()):
+                if _device_name in d["name"] and d["max_input_channels"] > 0:
+                    print(f"[init] Device index changed: {DEVICE_INDEX} -> {i} ({d['name']})")
+                    DEVICE_INDEX = i
+                    cfg["device_index"] = i
+                    save_config(cfg)
+                    break
+    except Exception:
+        for i, d in enumerate(sd.query_devices()):
+            if _device_name in d["name"] and d["max_input_channels"] > 0:
+                DEVICE_INDEX = i
+                cfg["device_index"] = i
+                save_config(cfg)
+                break
 WHISPER_SR = 16000
 STREAM_INTERVAL = cfg["stream_interval"]
 BEAM_INTERIM = cfg["beam_interim"]
