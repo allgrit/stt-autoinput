@@ -20,6 +20,7 @@ import pyperclip
 
 from config import load_config, save_config, needs_setup, detect_compute
 from setup_dialog import run_setup
+from audio_utils import trim_silence
 
 # ===== CONFIG =====
 cfg = load_config()
@@ -57,6 +58,10 @@ WHISPER_SR = 16000
 STREAM_INTERVAL = cfg["stream_interval"]
 BEAM_INTERIM = cfg["beam_interim"]
 BEAM_FINAL = cfg["beam_final"]
+REALTIME_PREVIEW = cfg["realtime_preview"]
+VAD_FILTER = cfg["vad_filter"]
+TRIM_SILENCE = cfg["trim_silence"]
+TRIM_SILENCE_RMS = cfg["trim_silence_rms"]
 SILENCE_RMS = cfg["silence_rms"]
 COMMIT_PAUSE = cfg["commit_pause"]
 
@@ -280,7 +285,7 @@ def apply_diff(old_text, new_text):
 def _bg_refine(audio_snap, old_text):
     try:
         segments, _ = model.transcribe(
-            audio_snap, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
+            audio_snap, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
         )
         final = " ".join(seg.text for seg in segments).strip()
     except Exception:
@@ -302,6 +307,10 @@ def transcription_worker():
     while True:
         if not stream_active:
             last_speech_time = 0.0
+            time.sleep(0.1)
+            continue
+
+        if not REALTIME_PREVIEW:
             time.sleep(0.1)
             continue
 
@@ -337,7 +346,7 @@ def transcription_worker():
 
         try:
             segments, _ = model.transcribe(
-                audio, language=LANG, beam_size=BEAM_INTERIM, vad_filter=True,
+                audio, language=LANG, beam_size=BEAM_INTERIM, vad_filter=VAD_FILTER,
             )
             new_text = " ".join(seg.text for seg in segments).strip()
         except Exception:
@@ -389,21 +398,42 @@ def do_finalize():
 
     audio = get_audio_snapshot()
 
-    if audio is None or len(audio) < WHISPER_SR * 0.3 or audio_is_silent(audio):
+    if audio is None or len(audio) < WHISPER_SR * 0.3:
         with text_lock:
             if current_text:
                 send_backspaces(len(current_text))
             current_text = ""
         last_status = ""
+        print("[final] no audio")
         return
 
+    raw_seconds = len(audio) / WHISPER_SR
+    if TRIM_SILENCE:
+        audio = trim_silence(audio, WHISPER_SR, TRIM_SILENCE_RMS)
+
+    if len(audio) < WHISPER_SR * 0.3 or audio_is_silent(audio):
+        with text_lock:
+            if current_text:
+                send_backspaces(len(current_text))
+            current_text = ""
+        last_status = ""
+        print(f"[final] no speech after trim ({raw_seconds:.1f}s raw)")
+        return
+
+    audio_seconds = len(audio) / WHISPER_SR
+    last_status = "Transcribing..."
+    print(f"[final] audio={audio_seconds:.1f}s raw={raw_seconds:.1f}s beam={BEAM_FINAL} vad={VAD_FILTER}")
+    started = time.perf_counter()
     try:
         segments, _ = model.transcribe(
-            audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
+            audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
         )
         raw_text = " ".join(seg.text for seg in segments).strip()
-    except Exception:
+    except Exception as e:
+        print(f"[final:error] {type(e).__name__}: {e}")
         raw_text = ""
+    elapsed = time.perf_counter() - started
+    print(f"[final] done in {elapsed:.1f}s")
 
     if not raw_text or is_hallucination(raw_text):
         with text_lock:
@@ -472,6 +502,7 @@ def on_toggle():
             stream_active = False
             is_recording = False
             threading.Thread(target=lambda: winsound.Beep(*BEEP_OFF), daemon=True).start()
+            print("[rec] OFF")
             do_finalize()
     finally:
         toggle_lock.release()
@@ -570,6 +601,8 @@ class Overlay:
             self.canvas.itemconfig(self.dot, fill=self.GRAY)
             if last_status and last_status.startswith("cmd:"):
                 self.label.config(text=last_status, fg=self.CYAN)
+            elif last_status:
+                self.label.config(text=last_status, fg=self.WHITE)
             else:
                 self.label.config(text=f"Ready  [{TOGGLE_KEY.upper()}]", fg=self.DIM)
 
@@ -639,7 +672,11 @@ if audio_stream is None:
 print(f"[ready] {TOGGLE_KEY.upper()} = toggle | {COMPUTE_DEVICE}")
 print("[cmds]  удалить слово / предложение / строку / всё")
 print("[cmds]  отменить, новая строка, новый абзац, таб, энтер")
-print(f"[filter] VAD + hallucination filter + auto-commit ({COMMIT_PAUSE}s)\n")
+print(
+    f"[mode] realtime_preview={REALTIME_PREVIEW} beam_final={BEAM_FINAL} "
+    f"vad={VAD_FILTER} trim={TRIM_SILENCE}"
+)
+print(f"[filter] hallucination filter + auto-commit ({COMMIT_PAUSE}s)\n")
 
 Overlay().run()
 

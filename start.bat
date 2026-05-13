@@ -1,4 +1,8 @@
 @echo off
 cd /d "%~dp0"
-"C:\Program Files\Git\bin\bash.exe" -c "cd '/c/Users/allgrit/Documents/codex/STL-autoinput' && '/c/Users/allgrit/AppData/Local/Programs/Python/Python311/python.exe' -u -c \"exec(open('dictate_realtime.py', encoding='utf-8').read())\""
-if errorlevel 1 pause
+set "PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=python"
+echo [%date% %time%] Starting STT Autoinput > "%~dp0stl_log.txt"
+echo Python: "%PYTHON%" >> "%~dp0stl_log.txt"
+"%PYTHON%" -u "%~dp0dictate_realtime.py" >> "%~dp0stl_log.txt" 2>&1
+echo [%date% %time%] Exited with code %errorlevel% >> "%~dp0stl_log.txt"
