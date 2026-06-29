@@ -20,9 +20,14 @@ DEFAULTS = {
     "beam_final": 1,
     "silence_rms": 0.003,
     "commit_pause": 1.5,
+    "max_buffer_s": 7.0,
+    "hard_max_buffer_s": 14.0,
+    "vad_min_silence_ms": 350,
+    "vad_threshold": 0.5,
     "beep_on": [1000, 100],
     "beep_off": [600, 100],
     "beep_cmd": [800, 50],
+    "initial_prompt": "Здравствуйте. Запятые, точки и заглавные буквы расставлены правильно.",
 }
 
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]

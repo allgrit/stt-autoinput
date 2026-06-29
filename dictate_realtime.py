@@ -4,17 +4,33 @@ import os
 import re
 import time
 import threading
+import signal
+import atexit
 import winsound
 import tkinter as tk
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 sys.stdout.reconfigure(encoding="utf-8")
 
+_PID_PATH = os.path.join(os.getcwd(), "stl.pid")
+_killed_old = False
+try:
+    old_pid = int(open(_PID_PATH).read().strip())
+    os.kill(old_pid, signal.SIGTERM)
+    _killed_old = True
+    print(f"[init] Killed old instance (PID {old_pid})")
+except (FileNotFoundError, ValueError, OSError):
+    pass
+with open(_PID_PATH, "w") as _f:
+    _f.write(str(os.getpid()))
+atexit.register(lambda: os.path.exists(_PID_PATH) and os.remove(_PID_PATH))
+
 import sounddevice as sd
 import numpy as np
 from scipy.signal import resample_poly
 from math import gcd
 from faster_whisper import WhisperModel
+from faster_whisper.vad import get_speech_timestamps, VadOptions
 import keyboard
 import pyperclip
 
@@ -36,12 +52,19 @@ TOGGLE_KEY = cfg["toggle_key"]
 # Auto-resolve device by name if index doesn't match
 DEVICE_INDEX = cfg["device_index"]
 _device_name = cfg.get("device_name", "")
+
+
+def _device_name_matches(target, candidate):
+    """Bidirectional substring: handles PortAudio name truncation on MME."""
+    return target in candidate or candidate in target
+
+
 if DEVICE_INDEX is not None and _device_name:
     try:
         info = sd.query_devices(DEVICE_INDEX)
-        if _device_name not in info.get("name", ""):
+        if not _device_name_matches(_device_name, info.get("name", "")):
             for i, d in enumerate(sd.query_devices()):
-                if _device_name in d["name"] and d["max_input_channels"] > 0:
+                if _device_name_matches(_device_name, d["name"]) and d["max_input_channels"] > 0:
                     print(f"[init] Device index changed: {DEVICE_INDEX} -> {i} ({d['name']})")
                     DEVICE_INDEX = i
                     cfg["device_index"] = i
@@ -49,7 +72,7 @@ if DEVICE_INDEX is not None and _device_name:
                     break
     except Exception:
         for i, d in enumerate(sd.query_devices()):
-            if _device_name in d["name"] and d["max_input_channels"] > 0:
+            if _device_name_matches(_device_name, d["name"]) and d["max_input_channels"] > 0:
                 DEVICE_INDEX = i
                 cfg["device_index"] = i
                 save_config(cfg)
@@ -64,6 +87,11 @@ TRIM_SILENCE = cfg["trim_silence"]
 TRIM_SILENCE_RMS = cfg["trim_silence_rms"]
 SILENCE_RMS = cfg["silence_rms"]
 COMMIT_PAUSE = cfg["commit_pause"]
+MAX_BUFFER_S = cfg.get("max_buffer_s", 7.0)
+HARD_MAX_BUFFER_S = cfg.get("hard_max_buffer_s", 14.0)
+VAD_MIN_SILENCE_MS = cfg.get("vad_min_silence_ms", 350)
+VAD_THRESHOLD = cfg.get("vad_threshold", 0.5)
+INITIAL_PROMPT = cfg.get("initial_prompt", "")
 
 BEEP_ON = tuple(cfg["beep_on"])
 BEEP_OFF = tuple(cfg["beep_off"])
@@ -215,12 +243,32 @@ except Exception as e:
     print(f"[init] GPU failed ({e}), falling back to CPU...")
     COMPUTE_DEVICE, COMPUTE_TYPE = "cpu", "float32"
     model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="float32")
+
+# Warm up both models so the first real utterance doesn't eat a multi-second
+# lazy-load stall (Silero VAD + CTranslate2 graph allocation).
+try:
+    _warm = np.zeros(WHISPER_SR, dtype=np.float32)
+    get_speech_timestamps(_warm, VadOptions(), sampling_rate=WHISPER_SR)
+    list(model.transcribe(_warm, language=LANG, beam_size=BEAM_FINAL)[0])
+except Exception as e:
+    print(f"[init] warmup skipped: {e}")
 print("[init] Ready.\n")
 
 # ===== STATE =====
+_T0 = time.monotonic()
+
+
+def ts():
+    return f"{time.monotonic() - _T0:7.2f}s"
+
+
 audio_lock = threading.Lock()
 text_lock = threading.Lock()
 toggle_lock = threading.Lock()
+# Serializes GPU inference: the worker (interim + vad-commit), do_finalize and
+# background _bg_refine threads all share one CTranslate2 model, which is not
+# safe for concurrent transcribe() calls — overlap caused multi-second stalls.
+model_lock = threading.Lock()
 audio_buffer = []
 is_recording = False
 stream_active = False
@@ -241,6 +289,55 @@ def audio_is_silent(audio):
     return np.sqrt(np.mean(audio ** 2)) < SILENCE_RMS
 
 
+def _vad_has_speech(audio16):
+    """VAD-based speech presence. Robust to mic level, unlike an absolute RMS
+    gate — the C922 mic records speech at RMS ~0.006, below any safe RMS floor,
+    so RMS silence detection drops whole phrases. Silero VAD keys on spectral
+    speech features instead. Fail-open on error: assume speech, let Whisper decide."""
+    try:
+        segs = get_speech_timestamps(
+            audio16,
+            VadOptions(
+                threshold=VAD_THRESHOLD,
+                min_speech_duration_ms=150,
+                min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+                speech_pad_ms=100,
+            ),
+            sampling_rate=WHISPER_SR,
+        )
+        return len(segs) > 0
+    except Exception:
+        return True
+
+
+def find_vad_split(audio16):
+    """Find a commit boundary (seconds) inside a silence gap, keeping the last
+    (possibly ongoing) speech region as tail. Returns None if no safe split —
+    e.g. fewer than two speech regions (one continuous phrase)."""
+    try:
+        segs = get_speech_timestamps(
+            audio16,
+            VadOptions(
+                threshold=VAD_THRESHOLD,
+                min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+                min_speech_duration_ms=200,
+                speech_pad_ms=200,
+            ),
+            sampling_rate=WHISPER_SR,
+        )
+    except Exception:
+        return None
+    if len(segs) < 2:
+        return None
+    # Cut in the middle of the silence gap before the last speech region, so the
+    # head holds all completed phrases and the tail holds the ongoing one.
+    gap_start = segs[-2]["end"]
+    gap_end = segs[-1]["start"]
+    if gap_end <= gap_start:  # padding swallowed the gap — no clean cut
+        return None
+    return ((gap_start + gap_end) // 2) / WHISPER_SR
+
+
 def recent_audio_is_silent():
     with audio_lock:
         if not audio_buffer:
@@ -249,8 +346,8 @@ def recent_audio_is_silent():
         recent = audio_buffer[-n_chunks:]
         if not recent:
             return True
-        audio = np.concatenate(recent, axis=0).flatten()
-    return audio_is_silent(audio)
+        raw = np.concatenate(recent, axis=0).flatten()
+    return not _vad_has_speech(resample_to_whisper(raw))
 
 
 def send_backspaces(n):
@@ -284,16 +381,21 @@ def apply_diff(old_text, new_text):
 # ===== BACKGROUND REFINE =====
 def _bg_refine(audio_snap, old_text):
     try:
-        segments, _ = model.transcribe(
-            audio_snap, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
-        )
-        final = " ".join(seg.text for seg in segments).strip()
+        with model_lock:
+            segments, _ = model.transcribe(
+                audio_snap, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
+                initial_prompt=INITIAL_PROMPT,
+            )
+            final = " ".join(seg.text for seg in segments).strip()
     except Exception:
         return
     if not final or is_hallucination(final) or final == old_text:
         return
     with text_lock:
-        if not current_text:
+        # stream_active guards against finishing after F9-off: do_finalize has
+        # already typed the final text, so refining here would inject stray
+        # backspaces/text into whatever window now has focus.
+        if stream_active and not current_text:
             send_backspaces(len(old_text))
             paste_text(final)
             print(f"[refine] {final}")
@@ -329,7 +431,7 @@ def transcription_worker():
                 with text_lock:
                     current_text = ""
                 last_speech_time = 0.0
-                print(f"[commit] {commit_old}")
+                print(f"[commit {ts()}] {commit_old}")
 
                 if commit_audio is not None and len(commit_audio) >= WHISPER_SR * 0.3:
                     threading.Thread(
@@ -344,11 +446,60 @@ def transcription_worker():
         if audio is None or len(audio) < WHISPER_SR * 0.3:
             continue
 
+        # ----- VAD segmentation: bound the buffer during continuous speech -----
+        # Without this the whole buffer is re-transcribed every interim pass, so
+        # cost grows O(n) per pass (and O(n^2) overall): the longer you speak the
+        # slower and worse it gets, and chunks get dropped. We lock completed
+        # phrases at a natural pause with beam=final and keep only the tail.
+        dur = len(audio) / WHISPER_SR
+        if dur >= MAX_BUFFER_S:
+            split_t = find_vad_split(audio)
+            head = None
+            whole = False
+            if split_t is not None:
+                cand = audio[: int(split_t * WHISPER_SR)]
+                if len(cand) >= WHISPER_SR * 0.3:
+                    head = cand
+            if head is None and dur >= HARD_MAX_BUFFER_S:
+                head, whole, split_t = audio, True, dur
+            if head is not None:
+                try:
+                    with model_lock:
+                        h_segs, _ = model.transcribe(
+                            head, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
+                            initial_prompt=INITIAL_PROMPT,
+                        )
+                        head_text = " ".join(s.text for s in h_segs).strip()
+                except Exception:
+                    head_text = ""
+                if not stream_active:
+                    # F9-off landed during transcription — do_finalize owns the
+                    # text now; don't paste a stale head or trim a cleared buffer.
+                    continue
+                ok = bool(head_text) and not is_hallucination(head_text)
+                with text_lock:
+                    if current_text:
+                        send_backspaces(len(current_text))
+                    if ok:
+                        paste_text(head_text)
+                    current_text = ""
+                with audio_lock:
+                    if whole:
+                        audio_buffer.clear()
+                    else:
+                        del audio_buffer[: int(split_t * DEVICE_SR / 1024)]
+                last_speech_time = 0.0
+                if ok:
+                    print(f"[vad-commit] {head_text}")
+                continue
+
         try:
-            segments, _ = model.transcribe(
-                audio, language=LANG, beam_size=BEAM_INTERIM, vad_filter=VAD_FILTER,
-            )
-            new_text = " ".join(seg.text for seg in segments).strip()
+            with model_lock:
+                segments, _ = model.transcribe(
+                    audio, language=LANG, beam_size=BEAM_INTERIM, vad_filter=VAD_FILTER,
+                    initial_prompt=INITIAL_PROMPT,
+                )
+                new_text = " ".join(seg.text for seg in segments).strip()
         except Exception:
             continue
 
@@ -411,7 +562,7 @@ def do_finalize():
     if TRIM_SILENCE:
         audio = trim_silence(audio, WHISPER_SR, TRIM_SILENCE_RMS)
 
-    if len(audio) < WHISPER_SR * 0.3 or audio_is_silent(audio):
+    if len(audio) < WHISPER_SR * 0.3 or not _vad_has_speech(audio):
         with text_lock:
             if current_text:
                 send_backspaces(len(current_text))
@@ -425,10 +576,12 @@ def do_finalize():
     print(f"[final] audio={audio_seconds:.1f}s raw={raw_seconds:.1f}s beam={BEAM_FINAL} vad={VAD_FILTER}")
     started = time.perf_counter()
     try:
-        segments, _ = model.transcribe(
-            audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
-        )
-        raw_text = " ".join(seg.text for seg in segments).strip()
+        with model_lock:
+            segments, _ = model.transcribe(
+                audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
+                initial_prompt=INITIAL_PROMPT,
+            )
+            raw_text = " ".join(seg.text for seg in segments).strip()
     except Exception as e:
         print(f"[final:error] {type(e).__name__}: {e}")
         raw_text = ""
@@ -436,6 +589,7 @@ def do_finalize():
     print(f"[final] done in {elapsed:.1f}s")
 
     if not raw_text or is_hallucination(raw_text):
+        print(f"[final] rejected: '{raw_text}'")
         with text_lock:
             if current_text:
                 send_backspaces(len(current_text))
@@ -497,10 +651,13 @@ def on_toggle():
             pyperclip.copy("")
             last_status = ""
             threading.Thread(target=lambda: winsound.Beep(*BEEP_ON), daemon=True).start()
-            print("[rec] ON")
+            print(f"[rec {ts()}] ON")
         else:
             stream_active = False
             is_recording = False
+            with audio_lock:
+                _n_chunks = len(audio_buffer)
+            print(f"[rec {ts()}] OFF  chunks={_n_chunks} ({_n_chunks*1024/DEVICE_SR:.1f}s)")
             threading.Thread(target=lambda: winsound.Beep(*BEEP_OFF), daemon=True).start()
             print("[rec] OFF")
             do_finalize()
@@ -509,7 +666,11 @@ def on_toggle():
 
 
 # ===== AUDIO CALLBACK =====
+_cb_count = 0
+
 def audio_callback(indata, frames, time_info, status):
+    global _cb_count
+    _cb_count += 1
     if is_recording:
         with audio_lock:
             audio_buffer.append(indata.copy())
@@ -630,39 +791,79 @@ keyboard.on_press_key("enter", lambda _: on_enter_pressed())
 
 audio_stream = None
 
+_API_PRIORITY = {"MME": 0, "Windows DirectSound": 1, "Windows WASAPI": 2, "Windows WDM-KS": 3}
+
+
 def _try_open_stream(dev_idx, sr):
+    global _cb_count
     try:
+        _cb_count = 0
         s = sd.InputStream(device=dev_idx, samplerate=sr, channels=1,
                            blocksize=1024, latency="high", callback=audio_callback)
         s.start()
+        time.sleep(0.3)
+        if _cb_count == 0:
+            s.stop()
+            s.close()
+            print(f"[warn] device {dev_idx} opened but no audio callbacks")
+            return None
         return s
-    except Exception:
+    except Exception as e:
+        print(f"[warn] device {dev_idx} open failed: {e}")
         return None
 
-audio_stream = _try_open_stream(DEVICE_INDEX, DEVICE_SR)
+
+def _apply_device(idx, sr):
+    global DEVICE_SR, _UP, _DOWN
+    DEVICE_SR = sr
+    _g = gcd(WHISPER_SR, DEVICE_SR)
+    _UP = WHISPER_SR // _g
+    _DOWN = DEVICE_SR // _g
+
+
+def _open_with_retry(dev_idx, sr, retries=3):
+    for attempt in range(retries):
+        if attempt > 0:
+            wait = 0.5 * (2 ** attempt)
+            print(f"[retry] device {dev_idx}, attempt {attempt + 1}/{retries} (wait {wait:.1f}s)")
+            time.sleep(wait)
+        stream = _try_open_stream(dev_idx, sr)
+        if stream is not None:
+            return stream
+    return None
+
+
+if _killed_old:
+    time.sleep(0.5)
+    audio_stream = _open_with_retry(DEVICE_INDEX, DEVICE_SR)
+else:
+    audio_stream = _try_open_stream(DEVICE_INDEX, DEVICE_SR)
 
 if audio_stream is None:
-    print(f"[warn] device {DEVICE_INDEX} failed, trying same mic on other APIs...")
     _target_name = cfg.get("device_name", "")
-    _candidates = []
+    _same_mic = []
+    _other = []
     for idx in range(len(sd.query_devices())):
         info = sd.query_devices(idx)
         if info["max_input_channels"] == 0 or idx == DEVICE_INDEX:
             continue
-        if _target_name and _target_name in info["name"]:
-            _candidates.insert(0, idx)
+        if _target_name and _device_name_matches(_target_name, info["name"]):
+            _same_mic.append(idx)
         else:
-            _candidates.append(idx)
-    for idx in _candidates:
+            _other.append(idx)
+    _same_mic.sort(key=lambda i: _API_PRIORITY.get(
+        sd.query_hostapis(sd.query_devices(i)["hostapi"])["name"], 9))
+    print(f"[fallback] same mic: {_same_mic}, other: {len(_other)}")
+    for idx in _same_mic + _other:
         info = sd.query_devices(idx)
         sr = int(info["default_samplerate"])
         audio_stream = _try_open_stream(idx, sr)
         if audio_stream is not None:
-            DEVICE_SR = sr
-            _g = gcd(WHISPER_SR, DEVICE_SR)
-            _UP = WHISPER_SR // _g
-            _DOWN = DEVICE_SR // _g
-            print(f"[ok] using [{idx}] {info['name']} ({sr} Hz)")
+            _apply_device(idx, sr)
+            api_name = sd.query_hostapis(info["hostapi"])["name"]
+            print(f"[ok] using [{idx}] {info['name']} ({sr} Hz, {api_name})")
+            cfg["device_index"] = idx
+            save_config(cfg)
             break
 
 if audio_stream is None:

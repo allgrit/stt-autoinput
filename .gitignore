@@ -9,4 +9,5 @@ dist/
 build/
 *.whl
 config.json
-stl_log.txt
+stl.pid
+stl_log*.txt
