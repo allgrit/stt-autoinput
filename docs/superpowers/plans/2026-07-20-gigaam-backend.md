@@ -15,6 +15,7 @@
 - Создать `stt_backend.py`: загрузка движков, преобразование WAV и единый интерфейс распознавания.
 - Создать `tests/test_stt_backend.py`: поведенческие тесты обоих адаптеров и очистки временных файлов.
 - Создать `tests/test_stt_config.py`: значения по умолчанию, список моделей и сохранение выбора в UI на уровне доступных чистых функций/исходного кода.
+- Создать `configure.py` и `settings.bat`: повторное открытие настроек без запуска диктовки.
 - Создать `tests/test_stt_wiring.py`: статическая проверка, что рабочий entrypoint использует адаптер, а не загружает Whisper напрямую.
 - Изменить `config.py`: настройки движка, модели GigaAM и чистая функция выбора моделей.
 - Изменить `setup_dialog.py`: переключатель движка и динамический список моделей.
@@ -28,6 +29,8 @@
 
 - Изменить: `config.py`
 - Изменить: `setup_dialog.py`
+- Создать: `configure.py`
+- Создать: `settings.bat`
 - Создать: `tests/test_stt_config.py`
 
 - [ ] **Шаг 1: написать падающий тест конфигурации**
@@ -65,6 +68,13 @@ class SttConfigTests(unittest.TestCase):
         self.assertIn('text="Recognition engine:"', source)
         self.assertIn('result["stt_engine"] = engine_var.get()', source)
         self.assertIn("models_for_engine", source)
+
+    def test_settings_launcher_reopens_and_saves_config(self):
+        configure = (ROOT / "configure.py").read_text(encoding="utf-8")
+        launcher = (ROOT / "settings.bat").read_text(encoding="utf-8")
+        self.assertIn("run_setup(load_config())", configure)
+        self.assertIn("save_config(cfg)", configure)
+        self.assertIn("configure.py", launcher)
 ```
 
 - [ ] **Шаг 2: запустить тест и подтвердить правильное падение**
@@ -158,19 +168,45 @@ result["stt_engine"] = engine_var.get()
 if engine_var.get() == "gigaam":
     result["gigaam_model"] = model_var.get()
 else:
-    result["model_size"] = model_var.get()
+result["model_size"] = model_var.get()
+```
+
+Создать `configure.py`:
+
+```python
+from config import load_config, save_config
+from setup_dialog import run_setup
+
+
+def main():
+    cfg = run_setup(load_config())
+    save_config(cfg)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Создать `settings.bat`:
+
+```bat
+@echo off
+cd /d "%~dp0"
+set "PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=python"
+"%PYTHON%" "%~dp0configure.py"
 ```
 
 - [ ] **Шаг 4: запустить тест конфигурации**
 
 Команда: `python -m pytest tests/test_stt_config.py -q`
 
-Ожидается: `3 passed`.
+Ожидается: `4 passed`.
 
 - [ ] **Шаг 5: зафиксировать изменение**
 
 ```powershell
-git add -- config.py setup_dialog.py tests/test_stt_config.py
+git add -- config.py setup_dialog.py configure.py settings.bat tests/test_stt_config.py
 git commit -m "Добавить выбор движка распознавания"
 ```
 
