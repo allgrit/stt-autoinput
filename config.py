@@ -13,7 +13,7 @@ DEFAULTS = {
     "device_name": None,
     "compute_device": "auto",
     "compute_type": "float16",
-    "realtime_preview": False,
+    "realtime_preview": True,
     "vad_filter": False,
     "trim_silence": True,
     "trim_silence_rms": 0.003,

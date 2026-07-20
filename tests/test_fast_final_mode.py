@@ -6,10 +6,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FastFinalModeTests(unittest.TestCase):
-    def test_realtime_preview_is_disabled_by_default(self):
+    def test_realtime_preview_is_enabled_by_default(self):
         config_source = (ROOT / "config.py").read_text(encoding="utf-8")
 
-        self.assertIn('"realtime_preview": False', config_source)
+        self.assertIn('"realtime_preview": True', config_source)
 
     def test_transcription_worker_skips_interim_transcribe_when_preview_disabled(self):
         app_source = (ROOT / "dictate_realtime.py").read_text(encoding="utf-8")
