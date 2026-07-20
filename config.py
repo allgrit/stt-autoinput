@@ -4,6 +4,8 @@ import os
 import sys
 
 DEFAULTS = {
+    "stt_engine": "gigaam",
+    "gigaam_model": "v3_e2e_rnnt",
     "model_size": "small",
     "language": "ru",
     "toggle_key": "f9",
@@ -31,6 +33,16 @@ DEFAULTS = {
 }
 
 MODEL_SIZES = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
+STT_ENGINES = ["gigaam", "whisper"]
+GIGAAM_MODELS = ["v3_e2e_rnnt"]
+
+
+def models_for_engine(engine):
+    if engine == "gigaam":
+        return list(GIGAAM_MODELS)
+    if engine == "whisper":
+        return list(MODEL_SIZES)
+    raise ValueError(f"Unknown STT engine: {engine}")
 
 
 def _config_path():

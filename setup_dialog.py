@@ -130,26 +130,51 @@ def run_setup(cfg):
     ttk.Button(btn_frame_mic, text="Test mic", command=start_vu_test).pack(side=tk.LEFT)
     ttk.Button(btn_frame_mic, text="Stop", command=stop_vu).pack(side=tk.LEFT, padx=5)
 
-    # --- Model ---
-    from config import MODEL_SIZES
+    # --- Recognition engine and model ---
+    from config import STT_ENGINES, models_for_engine
+
+    ttk.Label(main, text="Recognition engine:", style="Dark.TLabel").pack(anchor="w")
+    engine_var = tk.StringVar(value=cfg.get("stt_engine", "gigaam"))
+    engine_combo = ttk.Combobox(
+        main, textvariable=engine_var, values=STT_ENGINES,
+        state="readonly", width=20, font=("Segoe UI", 9),
+    )
+    engine_combo.pack(anchor="w", pady=(2, 10))
+
     ttk.Label(main, text="Model:", style="Dark.TLabel").pack(anchor="w")
 
-    model_var = tk.StringVar(value=cfg.get("model_size", "medium"))
-    model_combo = ttk.Combobox(main, textvariable=model_var, values=MODEL_SIZES,
-                                state="readonly", width=20, font=("Segoe UI", 9))
+    def configured_model(engine):
+        if engine == "gigaam":
+            return cfg.get("gigaam_model", "v3_e2e_rnnt")
+        return cfg.get("model_size", "medium")
+
+    model_var = tk.StringVar(value=configured_model(engine_var.get()))
+    model_combo = ttk.Combobox(
+        main, textvariable=model_var, values=models_for_engine(engine_var.get()),
+        state="readonly", width=20, font=("Segoe UI", 9),
+    )
     model_combo.pack(anchor="w", pady=(2, 10))
 
     vram_hint = {
+        "v3_e2e_rnnt": "GigaAM-v3, GPU/CPU",
         "tiny": "~1 GB VRAM", "base": "~1 GB", "small": "~2 GB",
         "medium": "~5 GB", "large-v2": "~10 GB", "large-v3": "~10 GB",
     }
-    model_hint = ttk.Label(main, text=vram_hint.get(model_var.get(), ""),
-                            style="Dark.TLabel")
+    model_hint = ttk.Label(
+        main, text=vram_hint.get(model_var.get(), ""), style="Dark.TLabel",
+    )
     model_hint.pack(anchor="w", pady=(0, 10))
 
     def on_model_change(event=None):
         model_hint.config(text=vram_hint.get(model_var.get(), ""))
 
+    def on_engine_change(event=None):
+        values = models_for_engine(engine_var.get())
+        model_combo.config(values=values)
+        model_var.set(configured_model(engine_var.get()))
+        on_model_change()
+
+    engine_combo.bind("<<ComboboxSelected>>", on_engine_change)
     model_combo.bind("<<ComboboxSelected>>", on_model_change)
 
     # --- Language ---
@@ -189,13 +214,17 @@ def run_setup(cfg):
             dev = devices[sel]
             result["device_index"] = dev["index"]
             result["device_name"] = dev["name"]
-        result["model_size"] = model_var.get()
+        result["stt_engine"] = engine_var.get()
+        if engine_var.get() == "gigaam":
+            result["gigaam_model"] = model_var.get()
+        else:
+            result["model_size"] = model_var.get()
         result["language"] = lang_var.get()
         result["toggle_key"] = hotkey_var.get()
         confirmed[0] = True
         root.destroy()
 
-    ttk.Button(main, text="Save & Start", command=on_save).pack(pady=(5, 0))
+    ttk.Button(main, text="Save", command=on_save).pack(pady=(5, 0))
 
     root.protocol("WM_DELETE_WINDOW", lambda: (stop_vu(), root.destroy()))
 
