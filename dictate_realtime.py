@@ -29,14 +29,14 @@ import sounddevice as sd
 import numpy as np
 from scipy.signal import resample_poly
 from math import gcd
-from faster_whisper import WhisperModel
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 import keyboard
 import pyperclip
 
-from config import load_config, save_config, needs_setup, detect_compute
+from config import load_config, save_config, needs_setup
 from setup_dialog import run_setup
 from audio_utils import trim_silence
+from stt_backend import create_stt_backend
 
 # ===== CONFIG =====
 cfg = load_config()
@@ -45,8 +45,6 @@ if needs_setup(cfg):
     cfg = run_setup(cfg)
     save_config(cfg)
 
-MODEL_SIZE = cfg["model_size"]
-LANG = cfg["language"]
 TOGGLE_KEY = cfg["toggle_key"]
 
 # Auto-resolve device by name if index doesn't match
@@ -79,7 +77,6 @@ if DEVICE_INDEX is not None and _device_name:
                 break
 WHISPER_SR = 16000
 STREAM_INTERVAL = cfg["stream_interval"]
-BEAM_INTERIM = cfg["beam_interim"]
 BEAM_FINAL = cfg["beam_final"]
 REALTIME_PREVIEW = cfg["realtime_preview"]
 VAD_FILTER = cfg["vad_filter"]
@@ -91,18 +88,9 @@ MAX_BUFFER_S = cfg.get("max_buffer_s", 7.0)
 HARD_MAX_BUFFER_S = cfg.get("hard_max_buffer_s", 14.0)
 VAD_MIN_SILENCE_MS = cfg.get("vad_min_silence_ms", 350)
 VAD_THRESHOLD = cfg.get("vad_threshold", 0.5)
-INITIAL_PROMPT = cfg.get("initial_prompt", "")
-
 BEEP_ON = tuple(cfg["beep_on"])
 BEEP_OFF = tuple(cfg["beep_off"])
 BEEP_CMD = tuple(cfg["beep_cmd"])
-
-# ===== COMPUTE DEVICE =====
-if cfg["compute_device"] == "auto":
-    COMPUTE_DEVICE, COMPUTE_TYPE = detect_compute()
-else:
-    COMPUTE_DEVICE = cfg["compute_device"]
-    COMPUTE_TYPE = cfg["compute_type"]
 
 # ===== HALLUCINATION FILTER =====
 HALLUCINATIONS = [
@@ -234,24 +222,21 @@ def resample_to_whisper(audio):
     return resample_poly(audio, _UP, _DOWN).astype(np.float32)
 
 
-# ===== MODEL =====
+# ===== STT BACKEND =====
 print(f"[init] {dev_info['name']} ({DEVICE_SR} Hz)")
-print(f"[init] Whisper '{MODEL_SIZE}' on {COMPUTE_DEVICE} ({COMPUTE_TYPE})...")
-try:
-    model = WhisperModel(MODEL_SIZE, device=COMPUTE_DEVICE, compute_type=COMPUTE_TYPE)
-except Exception as e:
-    print(f"[init] GPU failed ({e}), falling back to CPU...")
-    COMPUTE_DEVICE, COMPUTE_TYPE = "cpu", "float32"
-    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="float32")
+stt_backend = create_stt_backend(cfg)
 
-# Warm up both models so the first real utterance doesn't eat a multi-second
-# lazy-load stall (Silero VAD + CTranslate2 graph allocation).
+# Warm up VAD and the selected STT backend so the first real utterance doesn't
+# pay for lazy graph allocation.
+_warm = np.zeros(WHISPER_SR, dtype=np.float32)
 try:
-    _warm = np.zeros(WHISPER_SR, dtype=np.float32)
     get_speech_timestamps(_warm, VadOptions(), sampling_rate=WHISPER_SR)
-    list(model.transcribe(_warm, language=LANG, beam_size=BEAM_FINAL)[0])
 except Exception as e:
-    print(f"[init] warmup skipped: {e}")
+    print(f"[init] VAD warmup skipped: {e}")
+try:
+    stt_backend.transcribe(_warm, quality="final")
+except Exception as e:
+    print(f"[init] STT warmup skipped: {e}")
 print("[init] Ready.\n")
 
 # ===== STATE =====
@@ -266,8 +251,8 @@ audio_lock = threading.Lock()
 text_lock = threading.Lock()
 toggle_lock = threading.Lock()
 # Serializes GPU inference: the worker (interim + vad-commit), do_finalize and
-# background _bg_refine threads all share one CTranslate2 model, which is not
-# safe for concurrent transcribe() calls — overlap caused multi-second stalls.
+# background _bg_refine threads share one selected model, which may not be safe
+# for concurrent transcribe() calls — overlap previously caused long stalls.
 model_lock = threading.Lock()
 audio_buffer = []
 is_recording = False
@@ -382,11 +367,7 @@ def apply_diff(old_text, new_text):
 def _bg_refine(audio_snap, old_text):
     try:
         with model_lock:
-            segments, _ = model.transcribe(
-                audio_snap, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
-                initial_prompt=INITIAL_PROMPT,
-            )
-            final = " ".join(seg.text for seg in segments).strip()
+            final = stt_backend.transcribe(audio_snap, quality="final")
     except Exception:
         return
     if not final or is_hallucination(final) or final == old_text:
@@ -465,11 +446,9 @@ def transcription_worker():
             if head is not None:
                 try:
                     with model_lock:
-                        h_segs, _ = model.transcribe(
-                            head, language=LANG, beam_size=BEAM_FINAL, vad_filter=True,
-                            initial_prompt=INITIAL_PROMPT,
+                        head_text = stt_backend.transcribe(
+                            head, quality="final", force_vad=True,
                         )
-                        head_text = " ".join(s.text for s in h_segs).strip()
                 except Exception:
                     head_text = ""
                 if not stream_active:
@@ -495,11 +474,7 @@ def transcription_worker():
 
         try:
             with model_lock:
-                segments, _ = model.transcribe(
-                    audio, language=LANG, beam_size=BEAM_INTERIM, vad_filter=VAD_FILTER,
-                    initial_prompt=INITIAL_PROMPT,
-                )
-                new_text = " ".join(seg.text for seg in segments).strip()
+                new_text = stt_backend.transcribe(audio, quality="interim")
         except Exception:
             continue
 
@@ -573,15 +548,14 @@ def do_finalize():
 
     audio_seconds = len(audio) / WHISPER_SR
     last_status = "Transcribing..."
-    print(f"[final] audio={audio_seconds:.1f}s raw={raw_seconds:.1f}s beam={BEAM_FINAL} vad={VAD_FILTER}")
+    print(
+        f"[final] audio={audio_seconds:.1f}s raw={raw_seconds:.1f}s "
+        f"engine={stt_backend.engine} vad={VAD_FILTER}"
+    )
     started = time.perf_counter()
     try:
         with model_lock:
-            segments, _ = model.transcribe(
-                audio, language=LANG, beam_size=BEAM_FINAL, vad_filter=VAD_FILTER,
-                initial_prompt=INITIAL_PROMPT,
-            )
-            raw_text = " ".join(seg.text for seg in segments).strip()
+            raw_text = stt_backend.transcribe(audio, quality="final")
     except Exception as e:
         print(f"[final:error] {type(e).__name__}: {e}")
         raw_text = ""
@@ -870,7 +844,10 @@ if audio_stream is None:
     print("[error] No working audio device found!")
     sys.exit(1)
 
-print(f"[ready] {TOGGLE_KEY.upper()} = toggle | {COMPUTE_DEVICE}")
+print(
+    f"[ready] {TOGGLE_KEY.upper()} = toggle | "
+    f"{stt_backend.engine}:{stt_backend.device}"
+)
 print("[cmds]  удалить слово / предложение / строку / всё")
 print("[cmds]  отменить, новая строка, новый абзац, таб, энтер")
 print(
