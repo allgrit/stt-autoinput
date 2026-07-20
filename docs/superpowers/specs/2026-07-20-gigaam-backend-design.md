@@ -33,8 +33,8 @@
 - `create_stt_backend(cfg)` создаёт только выбранный движок.
 - `GigaAMBackend` загружает `gigaam.load_model("v3_e2e_rnnt")` на CUDA при её доступности, иначе на CPU.
 - `WhisperBackend` сохраняет существующую загрузку `WhisperModel`, включая переход на CPU при ошибке CUDA.
-- Оба адаптера предоставляют один метод `transcribe(audio, quality) -> str`, где `audio` — монофонический `numpy.float32` с частотой 16 кГц, а `quality` принимает значения `interim` или `final`.
-- Whisper сопоставляет `quality` с существующими `beam_interim` / `beam_final`, `vad_filter` и `initial_prompt`.
+- Оба адаптера предоставляют один метод `transcribe(audio, quality, force_vad=False) -> str`, где `audio` — монофонический `numpy.float32` с частотой 16 кГц, а `quality` принимает значения `interim` или `final`.
+- Whisper сопоставляет `quality` с существующими `beam_interim` / `beam_final`, `vad_filter` и `initial_prompt`; `force_vad=True` сохраняет принудительный VAD в пути разрезания переполненного буфера.
 - GigaAM использует один и тот же инференс для обоих режимов: неподдерживаемые параметры Whisper ей не передаются.
 
 Существующий `model_lock` продолжает сериализовать обращения к GPU. Все прямые вызовы `model.transcribe(...)` в `dictate_realtime.py` заменяются вызовами общего адаптера, который сразу возвращает строку.
