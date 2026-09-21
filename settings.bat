@@ -1,5 +1,4 @@
 @echo off
 cd /d "%~dp0"
-set "PYTHON=%~dp0.venv\Scripts\python.exe"
-if not exist "%PYTHON%" set "PYTHON=python"
+call "%~dp0find_python.bat"
 "%PYTHON%" "%~dp0configure.py"
