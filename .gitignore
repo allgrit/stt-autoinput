@@ -12,3 +12,4 @@ config.json
 stl.pid
 stl_log*.txt
 .worktrees/
+.scratch/
