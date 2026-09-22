@@ -36,6 +36,7 @@ import pyperclip
 from config import load_config, save_config, needs_setup
 from setup_dialog import run_setup
 from audio_utils import trim_silence
+from audio_stream_guard import clamp_to_screen, recover_stream
 from stt_backend import create_stt_backend
 
 # ===== CONFIG =====
@@ -626,6 +627,7 @@ def on_toggle():
             last_status = ""
             threading.Thread(target=lambda: winsound.Beep(*BEEP_ON), daemon=True).start()
             print(f"[rec {ts()}] ON")
+            threading.Thread(target=_ensure_stream_alive, daemon=True).start()
         else:
             stream_active = False
             is_recording = False
@@ -658,6 +660,7 @@ class Overlay:
     WHITE = "#e0e0e0"
     DIM = "#777777"
     CYAN = "#66cccc"
+    SCREEN_MARGIN = 48  # высота панели задач
 
     def __init__(self):
         self.root = tk.Tk()
@@ -703,6 +706,12 @@ class Overlay:
     def _drag_move(self, e):
         x = self.root.winfo_x() + e.x - self._dx
         y = self.root.winfo_y() + e.y - self._dy
+        # Не даём утащить виджет за край экрана или под панель задач.
+        x, y = clamp_to_screen(
+            x, y, self.root.winfo_width(), self.root.winfo_height(),
+            self.root.winfo_screenwidth(), self.root.winfo_screenheight(),
+            margin=self.SCREEN_MARGIN,
+        )
         self.root.geometry(f"+{x}+{y}")
 
     def _context_menu(self, e):
@@ -764,6 +773,7 @@ keyboard.on_press_key(TOGGLE_KEY, lambda _: threading.Thread(target=on_toggle, d
 keyboard.on_press_key("enter", lambda _: on_enter_pressed())
 
 audio_stream = None
+stream_lock = threading.Lock()
 
 _API_PRIORITY = {"MME": 0, "Windows DirectSound": 1, "Windows WASAPI": 2, "Windows WDM-KS": 3}
 
@@ -807,13 +817,8 @@ def _open_with_retry(dev_idx, sr, retries=3):
     return None
 
 
-if _killed_old:
-    time.sleep(0.5)
-    audio_stream = _open_with_retry(DEVICE_INDEX, DEVICE_SR)
-else:
-    audio_stream = _try_open_stream(DEVICE_INDEX, DEVICE_SR)
-
-if audio_stream is None:
+def _open_fallback_stream():
+    """Перебрать входные устройства: сначала тот же микрофон по имени, потом остальные."""
     _target_name = cfg.get("device_name", "")
     _same_mic = []
     _other = []
@@ -831,14 +836,51 @@ if audio_stream is None:
     for idx in _same_mic + _other:
         info = sd.query_devices(idx)
         sr = int(info["default_samplerate"])
-        audio_stream = _try_open_stream(idx, sr)
-        if audio_stream is not None:
+        stream = _try_open_stream(idx, sr)
+        if stream is not None:
             _apply_device(idx, sr)
             api_name = sd.query_hostapis(info["hostapi"])["name"]
             print(f"[ok] using [{idx}] {info['name']} ({sr} Hz, {api_name})")
             cfg["device_index"] = idx
             save_config(cfg)
-            break
+            return stream
+    return None
+
+
+def _reopen_stream():
+    stream = _open_with_retry(DEVICE_INDEX, DEVICE_SR)
+    if stream is None:
+        stream = _open_fallback_stream()
+    return stream
+
+
+def _ensure_stream_alive(probe_s=0.3):
+    """Фоновая проверка при включении записи: поток обязан доставлять callback'и.
+
+    USB-микрофон после переподключения или сброса драйвера оставляет PortAudio-поток
+    формально открытым, но пустым — запись даёт chunks=0. Тогда переоткрываем.
+    """
+    global audio_stream, last_status
+    before = _cb_count
+    time.sleep(probe_s)
+    with stream_lock:
+        if audio_stream is None:
+            return
+        stream = recover_stream(audio_stream, before, _cb_count, _reopen_stream)
+        if stream is None:
+            last_status = "mic: no audio"
+            return
+        audio_stream = stream
+
+
+if _killed_old:
+    time.sleep(0.5)
+    audio_stream = _open_with_retry(DEVICE_INDEX, DEVICE_SR)
+else:
+    audio_stream = _try_open_stream(DEVICE_INDEX, DEVICE_SR)
+
+if audio_stream is None:
+    audio_stream = _open_fallback_stream()
 
 if audio_stream is None:
     print("[error] No working audio device found!")
