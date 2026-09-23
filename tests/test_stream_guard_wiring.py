@@ -14,8 +14,9 @@ class StreamGuardWiringTests(unittest.TestCase):
         self.assertIn("recover_stream(", self.src)
         self.assertIn("def _ensure_stream_alive", self.src)
 
-    def test_widget_drag_keeps_window_on_screen(self):
-        self.assertIn("clamp_to_screen(", self.src)
+    def test_widget_drag_is_not_clamped_to_screen(self):
+        # Пользователь ставит виджет на панель задач — ограничивать нельзя.
+        self.assertNotIn("clamp_to_screen", self.src)
 
 
 if __name__ == "__main__":

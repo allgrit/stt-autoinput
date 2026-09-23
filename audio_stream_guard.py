@@ -1,9 +1,9 @@
-"""Защита аудиопотока от «тихой смерти» и удержание виджета в экране.
+"""Защита аудиопотока от «тихой смерти».
 
 PortAudio-поток, открытый один раз при старте, может перестать доставлять
 callback'и (переподключение USB-микрофона, сброс драйвера) без единого
 исключения. Снаружи это выглядит как запись с chunks=0. Здесь чистая логика,
-без sounddevice и tkinter, чтобы её можно было тестировать.
+без sounddevice, чтобы её можно было тестировать.
 """
 from __future__ import annotations
 
@@ -42,11 +42,3 @@ def recover_stream(
     else:
         log("[ok] audio stream reopened")
     return new_stream
-
-
-def clamp_to_screen(x: int, y: int, w: int, h: int, screen_w: int, screen_h: int,
-                    margin: int = 0) -> tuple[int, int]:
-    """Координаты окна, при которых оно целиком остаётся в пределах экрана."""
-    max_x = max(0, screen_w - w - margin)
-    max_y = max(0, screen_h - h - margin)
-    return min(max(x, 0), max_x), min(max(y, 0), max_y)
