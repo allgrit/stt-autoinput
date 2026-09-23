@@ -36,7 +36,7 @@ import pyperclip
 from config import load_config, save_config, needs_setup
 from setup_dialog import run_setup
 from audio_utils import trim_silence
-from audio_stream_guard import clamp_to_screen, recover_stream
+from audio_stream_guard import recover_stream
 from stt_backend import create_stt_backend
 
 # ===== CONFIG =====
@@ -660,7 +660,6 @@ class Overlay:
     WHITE = "#e0e0e0"
     DIM = "#777777"
     CYAN = "#66cccc"
-    SCREEN_MARGIN = 48  # высота панели задач
 
     def __init__(self):
         self.root = tk.Tk()
@@ -706,12 +705,6 @@ class Overlay:
     def _drag_move(self, e):
         x = self.root.winfo_x() + e.x - self._dx
         y = self.root.winfo_y() + e.y - self._dy
-        # Не даём утащить виджет за край экрана или под панель задач.
-        x, y = clamp_to_screen(
-            x, y, self.root.winfo_width(), self.root.winfo_height(),
-            self.root.winfo_screenwidth(), self.root.winfo_screenheight(),
-            margin=self.SCREEN_MARGIN,
-        )
         self.root.geometry(f"+{x}+{y}")
 
     def _context_menu(self, e):
